@@ -9,20 +9,32 @@ import zipfile
 import re
 
 # ==========================================
-# CONFIGURATION
+# ANALYSIS CONFIGURATION
 # ==========================================
-# Analysis Parameters
-CROP_MARGIN = 0.1      
-SMOOTH_WINDOW = 15      
-SMOOTH_POLY = 3         
-PEAK_PROMINENCE = 0.5   
-T_PEAK_MIN_POS = 55
-T_PEAK_MAX_POS = 100
+CROP_MARGIN = 0.1
+SMOOTH_WINDOW = 15
+SMOOTH_POLY = 3
+PEAK_PROMINENCE = 0.5
+
+# --- NEW: RELATIVE POSITIONING ---
+# Instead of fixed pixels (30-60), we define where T is relative to C.
+# "The Test line is usually found at 30% to 60% of the distance from the top,
+# relative to the Control line's position."
+# BUT simpler: T is always "upstream" of C.
+# We will search for T in a window defined by the C position.
+# E.g., T is usually 100-200 pixels away? No, that depends on resolution.
+# Better: We assume T is roughly at 1/3 to 2/3 of the strip length relative to C.
+# Let's stick to the physical logic: T is always ABOVE C.
+
+# --- NEW: BASELINE CLAMPING ---
+MAX_PEAK_WIDTH = 35  # Max width (in pixels) allowed for a single peak's base.
+                     # If the algorithm finds a base width of 80, we clip it to +/- 25 from peak.
 
 # ==========================================
-# CORE ANALYSIS FUNCTIONS (Unchanged)
+# HELPER FUNCTIONS
 # ==========================================
 def flatten_profile(profile):
+    """Removes linear tilt from profile."""
     x = np.arange(len(profile))
     margin = int(len(profile) * 0.10)
     bg_mask = np.concatenate([np.arange(margin), np.arange(len(profile)-margin, len(profile))])
@@ -66,9 +78,12 @@ def analyze_single_strip(img_array, crop_margin=0.0):
         smooth_profile = raw_profile
 
     smooth_profile = flatten_profile(smooth_profile)
+    
+    # Find ALL peaks first
     peaks, properties = find_peaks(smooth_profile, prominence=PEAK_PROMINENCE, distance=10, width=2)
     
     height = len(smooth_profile)
+    # Estimate Split Point (roughly middle) to distinguish T vs C zone initially
     split_point = int(height * 0.6)
     
     t_area, c_area = 0.0, 0.0
@@ -76,33 +91,66 @@ def analyze_single_strip(img_array, crop_margin=0.0):
     t_baseline_x, t_baseline_y = [], []
     c_baseline_x, c_baseline_y = [], []
 
-    # Test Line
-    t_candidates = [p for p in peaks if (p < split_point) and (T_PEAK_MIN_POS <= p <= T_PEAK_MAX_POS)]
-    if t_candidates:
-        t_indices = [np.where(peaks == p)[0][0] for p in t_candidates]
-        best_t = t_candidates[np.argmax(properties['prominences'][t_indices])]
-        t_pos = best_t
-        results = peak_widths(smooth_profile, [best_t], rel_height=0.95)
-        x_s, x_e = max(0, int(results[2][0])), min(len(smooth_profile)-1, int(results[3][0]))
-        if x_e > x_s:
-            base_val = min(smooth_profile[x_s], smooth_profile[x_e])
-            t_area = np.sum(smooth_profile[x_s:x_e+1] - base_val)
-            t_baseline_x = [x_s, x_e]
-            t_baseline_y = [base_val, base_val]
-
-    # Control Line
-    c_candidates = [p for p in peaks if p >= split_point]
+    # 1. FIND CONTROL LINE FIRST (It's the strongest/most reliable anchor)
+    # It usually sits in the bottom half of the strip
+    c_candidates = [p for p in peaks if p > split_point]
+    
     if c_candidates:
         c_indices = [np.where(peaks == p)[0][0] for p in c_candidates]
-        best_c = c_candidates[np.argmax(properties['prominences'][c_indices])]
-        c_pos = best_c
-        results = peak_widths(smooth_profile, [best_c], rel_height=0.95)
-        x_s, x_e = max(0, int(results[2][0])), min(len(smooth_profile)-1, int(results[3][0]))
+        # Pick the strongest peak in the bottom half
+        best_c_idx = c_indices[np.argmax(properties['prominences'][c_indices])]
+        c_pos = peaks[best_c_idx]
+        
+        # --- BASELINE CLAMPING (Fix #2) ---
+        results = peak_widths(smooth_profile, [c_pos], rel_height=0.95)
+        raw_width = results[0][0]
+        
+        # Center of the peak
+        center = c_pos
+        
+        # Calculate boundaries
+        # If width is excessive, clamp it
+        half_width = min(raw_width / 2, MAX_PEAK_WIDTH / 2)
+        x_s = max(0, int(center - half_width))
+        x_e = min(height - 1, int(center + half_width))
+        
+        # Integration
         if x_e > x_s:
             base_val = min(smooth_profile[x_s], smooth_profile[x_e])
             c_area = np.sum(smooth_profile[x_s:x_e+1] - base_val)
             c_baseline_x = [x_s, x_e]
             c_baseline_y = [base_val, base_val]
+
+    # 2. FIND TEST LINE (Relative to Control)
+    # We look for a peak that is "upstream" (lower pixel index) from C
+    # Expected Distance: usually 1/3 to 1/2 of the total strip length away
+    # Search Window: From 0 to (C_Pos - Buffer)
+    if not np.isnan(c_pos):
+        # Search for T in the region BEFORE C
+        # e.g., T must be at least 20 pixels away from C to avoid merging
+        search_end = int(c_pos - 20)
+        t_candidates = [p for p in peaks if p < search_end]
+        
+        if t_candidates:
+            t_indices = [np.where(peaks == p)[0][0] for p in t_candidates]
+            # Pick strongest in that region
+            best_t_idx = t_indices[np.argmax(properties['prominences'][t_indices])]
+            t_pos = peaks[best_t_idx]
+            
+            # --- BASELINE CLAMPING (Fix #2) ---
+            results = peak_widths(smooth_profile, [t_pos], rel_height=0.95)
+            raw_width = results[0][0]
+            
+            center = t_pos
+            half_width = min(raw_width / 2, MAX_PEAK_WIDTH / 2)
+            x_s = max(0, int(center - half_width))
+            x_e = min(height - 1, int(center + half_width))
+            
+            if x_e > x_s:
+                base_val = min(smooth_profile[x_s], smooth_profile[x_e])
+                t_area = np.sum(smooth_profile[x_s:x_e+1] - base_val)
+                t_baseline_x = [x_s, x_e]
+                t_baseline_y = [base_val, base_val]
 
     ratio = t_area / c_area if c_area > 0 else 0
     
@@ -118,6 +166,7 @@ def create_plot(res, title, color='blue'):
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(res['profile'], color=color, linewidth=2, label='Profile')
     
+    # Mark Test Line Baseline
     if len(res['t_base_x']) > 0:
         t_val = res['t_base_y'][0]
         ax.plot(res['t_base_x'], res['t_base_y'], 'r--', linewidth=2)
@@ -126,6 +175,7 @@ def create_plot(res, title, color='blue'):
                          t_val, alpha=0.3, color='green')
         ax.text(res['t_pos'], res['profile'][int(res['t_pos'])]+5, f"T:{res['t_area']:.1f}", color="green", ha='center')
 
+    # Mark Control Line Baseline
     if len(res['c_base_x']) > 0:
         c_val = res['c_base_y'][0]
         ax.plot(res['c_base_x'], res['c_base_y'], 'r--', linewidth=2)
@@ -134,7 +184,9 @@ def create_plot(res, title, color='blue'):
                          c_val, alpha=0.3, color='orange')
         ax.text(res['c_pos'], res['profile'][int(res['c_pos'])]+5, f"C:{res['c_area']:.1f}", color="red", ha='center')
 
-    ax.axvspan(T_PEAK_MIN_POS, T_PEAK_MAX_POS, color='gray', alpha=0.1, label='Valid T-Region')
+    # Remove the fixed gray span, since T-region is now dynamic
+    # ax.axvspan(...) 
+    
     ax.set_title(f"{title}\nR={res['ratio']:.4f}")
     plt.tight_layout()
     return fig
