@@ -9,32 +9,21 @@ import zipfile
 import re
 
 # ==========================================
-# ANALYSIS CONFIGURATION
+# ⚙️ HARDCODED KNOBS
 # ==========================================
-CROP_MARGIN = 0.1
+FIXED_CROP_MARGIN = 0.1
 SMOOTH_WINDOW = 15
-SMOOTH_POLY = 3
-PEAK_PROMINENCE = 0.5
+MAX_PEAK_WIDTH = 30 # Upper limit: If a peak is wider than this, we clip it.
 
-# --- NEW: RELATIVE POSITIONING ---
-# Instead of fixed pixels (30-60), we define where T is relative to C.
-# "The Test line is usually found at 30% to 60% of the distance from the top,
-# relative to the Control line's position."
-# BUT simpler: T is always "upstream" of C.
-# We will search for T in a window defined by the C position.
-# E.g., T is usually 100-200 pixels away? No, that depends on resolution.
-# Better: We assume T is roughly at 1/3 to 2/3 of the strip length relative to C.
-# Let's stick to the physical logic: T is always ABOVE C.
-
-# --- NEW: BASELINE CLAMPING ---
-MAX_PEAK_WIDTH = 35  # Max width (in pixels) allowed for a single peak's base.
-                     # If the algorithm finds a base width of 80, we clip it to +/- 25 from peak.
+# --- Search Parameters ---
+T_DIST_NEAR = 20
+T_DIST_FAR = 120
+BASELINE_METHOD = 'lower'
 
 # ==========================================
-# HELPER FUNCTIONS
+# CORE ALGORITHMS
 # ==========================================
 def flatten_profile(profile):
-    """Removes linear tilt from profile."""
     x = np.arange(len(profile))
     margin = int(len(profile) * 0.10)
     bg_mask = np.concatenate([np.arange(margin), np.arange(len(profile)-margin, len(profile))])
@@ -45,393 +34,244 @@ def flatten_profile(profile):
         return flattened - np.min(flattened)
     return profile
 
-def analyze_single_strip(img_array, crop_margin=0.0):
-    # Ensure input is a valid numpy array
-    if len(img_array.shape) == 3:
-        img = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-    else:
-        img = img_array
+def analyze_single_strip(img_array, crop_margin=FIXED_CROP_MARGIN):
+    if len(img_array.shape) == 3: img = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    else: img = img_array
 
-    # Auto-rotate if horizontal
-    h, w = img.shape
-    if w > h:
+    if img.shape[1] > img.shape[0]:
         img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
 
     h, w = img.shape
-    
-    # Cropping
-    if crop_margin > 0:
-        px_cut = int(w * crop_margin)
-        img_roi = img[:, px_cut : w - px_cut]
-    else:
-        img_roi = img 
+    px_cut = int(w * crop_margin)
+    if px_cut * 2 >= w: return None 
+    img_roi = img[:, px_cut : w - px_cut]
 
-    if img_roi.shape[1] < 5: return None
-
-    # Processing
-    img_inverted = 255 - img_roi
-    raw_profile = np.mean(img_inverted, axis=1)
-    
+    raw_profile = np.mean(255 - img_roi, axis=1)
     try:
-        smooth_profile = savgol_filter(raw_profile, window_length=SMOOTH_WINDOW, polyorder=SMOOTH_POLY)
+        smooth_profile = savgol_filter(raw_profile, window_length=SMOOTH_WINDOW, polyorder=3)
     except:
         smooth_profile = raw_profile
-
+    
     smooth_profile = flatten_profile(smooth_profile)
+    peaks, properties = find_peaks(smooth_profile, prominence=0.5, distance=10, width=2)
     
-    # Find ALL peaks first
-    peaks, properties = find_peaks(smooth_profile, prominence=PEAK_PROMINENCE, distance=10, width=2)
+    res = {
+        "profile": smooth_profile, "ratio": 0.0,
+        "t_area": 0.0, "c_area": 0.0,
+        "t_pos": np.nan, "c_pos": np.nan,
+        "t_base_x": [], "t_base_y": [], "c_base_x": [], "c_base_y": [],
+        "search_window": []
+    }
     
+    # Calculate widths for ALL peaks found
+    # rel_height=0.95 measures width near the base of the peak
+    widths_results = peak_widths(smooth_profile, peaks, rel_height=0.95)
+    
+    # 3. Find CONTROL Line
     height = len(smooth_profile)
-    # Estimate Split Point (roughly middle) to distinguish T vs C zone initially
-    split_point = int(height * 0.6)
-    
-    t_area, c_area = 0.0, 0.0
-    t_pos, c_pos = np.nan, np.nan
-    t_baseline_x, t_baseline_y = [], []
-    c_baseline_x, c_baseline_y = [], []
-
-    # 1. FIND CONTROL LINE FIRST (It's the strongest/most reliable anchor)
-    # It usually sits in the bottom half of the strip
+    split_point = int(height * 0.5)
     c_candidates = [p for p in peaks if p > split_point]
     
     if c_candidates:
         c_indices = [np.where(peaks == p)[0][0] for p in c_candidates]
-        # Pick the strongest peak in the bottom half
         best_c_idx = c_indices[np.argmax(properties['prominences'][c_indices])]
-        c_pos = peaks[best_c_idx]
+        best_c = peaks[best_c_idx]
+        res['c_pos'] = best_c
         
-        # --- BASELINE CLAMPING (Fix #2) ---
-        results = peak_widths(smooth_profile, [c_pos], rel_height=0.95)
-        raw_width = results[0][0]
+        # Get the detected width for this specific peak
+        # widths_results[2] is Left Intersection, widths_results[3] is Right Intersection
+        c_left = widths_results[2][best_c_idx]
+        c_right = widths_results[3][best_c_idx]
         
-        # Center of the peak
-        center = c_pos
-        
-        # Calculate boundaries
-        # If width is excessive, clamp it
-        half_width = min(raw_width / 2, MAX_PEAK_WIDTH / 2)
-        x_s = max(0, int(center - half_width))
-        x_e = min(height - 1, int(center + half_width))
-        
-        # Integration
-        if x_e > x_s:
-            base_val = min(smooth_profile[x_s], smooth_profile[x_e])
-            c_area = np.sum(smooth_profile[x_s:x_e+1] - base_val)
-            c_baseline_x = [x_s, x_e]
-            c_baseline_y = [base_val, base_val]
+        integrate_peak_smart(res, best_c, c_left, c_right, height, 'c')
 
-    # 2. FIND TEST LINE (Relative to Control)
-    # We look for a peak that is "upstream" (lower pixel index) from C
-    # Expected Distance: usually 1/3 to 1/2 of the total strip length away
-    # Search Window: From 0 to (C_Pos - Buffer)
-    if not np.isnan(c_pos):
-        # Search for T in the region BEFORE C
-        # e.g., T must be at least 20 pixels away from C to avoid merging
-        search_end = int(c_pos - 20)
-        t_candidates = [p for p in peaks if p < search_end]
+        # 4. Find TEST Line
+        search_end = int(best_c - T_DIST_NEAR)
+        search_start = max(0, int(best_c - T_DIST_FAR))
+        res['search_window'] = [search_start, search_end]
+        
+        t_candidates = [p for p in peaks if search_start <= p < search_end]
         
         if t_candidates:
             t_indices = [np.where(peaks == p)[0][0] for p in t_candidates]
-            # Pick strongest in that region
             best_t_idx = t_indices[np.argmax(properties['prominences'][t_indices])]
-            t_pos = peaks[best_t_idx]
+            best_t = peaks[best_t_idx]
+            res['t_pos'] = best_t
             
-            # --- BASELINE CLAMPING (Fix #2) ---
-            results = peak_widths(smooth_profile, [t_pos], rel_height=0.95)
-            raw_width = results[0][0]
+            t_left = widths_results[2][best_t_idx]
+            t_right = widths_results[3][best_t_idx]
             
-            center = t_pos
-            half_width = min(raw_width / 2, MAX_PEAK_WIDTH / 2)
-            x_s = max(0, int(center - half_width))
-            x_e = min(height - 1, int(center + half_width))
-            
-            if x_e > x_s:
-                base_val = min(smooth_profile[x_s], smooth_profile[x_e])
-                t_area = np.sum(smooth_profile[x_s:x_e+1] - base_val)
-                t_baseline_x = [x_s, x_e]
-                t_baseline_y = [base_val, base_val]
+            integrate_peak_smart(res, best_t, t_left, t_right, height, 't')
 
-    ratio = t_area / c_area if c_area > 0 else 0
+    res['ratio'] = res['t_area'] / res['c_area'] if res['c_area'] > 0 else 0
+    return res
+
+def integrate_peak_smart(res, peak_pos, left_idx, right_idx, height, prefix):
+    """
+    Uses detected peak width BUT clamps it if it exceeds MAX_PEAK_WIDTH.
+    """
+    # 1. Get detected start/end
+    x_s = int(left_idx)
+    x_e = int(right_idx)
     
-    return {
-        "profile": smooth_profile,
-        "t_area": t_area, "c_area": c_area, "ratio": ratio,
-        "t_pos": t_pos, "c_pos": c_pos,
-        "t_base_x": t_baseline_x, "t_base_y": t_baseline_y,
-        "c_base_x": c_baseline_x, "c_base_y": c_baseline_y
-    }
+    # 2. Check width
+    current_width = x_e - x_s
+    
+    # 3. Clamp if too wide (Center +/- Max/2)
+    if current_width > MAX_PEAK_WIDTH:
+        half_max = MAX_PEAK_WIDTH // 2
+        x_s = max(0, int(peak_pos - half_max))
+        x_e = min(height - 1, int(peak_pos + half_max))
+    else:
+        # Safety bounds
+        x_s = max(0, x_s)
+        x_e = min(height - 1, x_e)
+
+    if x_e > x_s:
+        curve = res['profile']
+        y_s = curve[x_s]
+        y_e = curve[x_e]
+        
+        if BASELINE_METHOD == 'lower':
+            base_val = min(y_s, y_e)
+        elif BASELINE_METHOD == 'higher':
+            base_val = max(y_s, y_e)
+        else: # average
+            base_val = (y_s + y_e) / 2
+            
+        area = np.sum(curve[x_s:x_e+1] - base_val)
+        
+        res[f'{prefix}_area'] = area
+        res[f'{prefix}_base_x'] = [x_s, x_e]
+        res[f'{prefix}_base_y'] = [base_val, base_val]
 
 def create_plot(res, title, color='blue'):
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(res['profile'], color=color, linewidth=2, label='Profile')
+    ax.plot(res['profile'], color=color, linewidth=2)
     
-    # Mark Test Line Baseline
-    if len(res['t_base_x']) > 0:
-        t_val = res['t_base_y'][0]
-        ax.plot(res['t_base_x'], res['t_base_y'], 'r--', linewidth=2)
-        ax.fill_between(range(res['t_base_x'][0], res['t_base_x'][1]+1), 
-                         res['profile'][res['t_base_x'][0]:res['t_base_x'][1]+1], 
-                         t_val, alpha=0.3, color='green')
-        ax.text(res['t_pos'], res['profile'][int(res['t_pos'])]+5, f"T:{res['t_area']:.1f}", color="green", ha='center')
+    for p_type, col in [('t', 'green'), ('c', 'orange')]:
+        if len(res[f'{p_type}_base_x']) > 0:
+            bx, by = res[f'{p_type}_base_x'], res[f'{p_type}_base_y']
+            ax.plot(bx, by, 'r--', linewidth=2)
+            ax.fill_between(range(bx[0], bx[1]+1), res['profile'][bx[0]:bx[1]+1], by[0], alpha=0.3, color=col)
+            if not np.isnan(res[f'{p_type}_pos']):
+                ax.text(res[f'{p_type}_pos'], res['profile'][int(res[f'{p_type}_pos'])]+5, 
+                        f"{p_type.upper()}:{res[f'{p_type}_area']:.1f}", color='red', ha='center')
 
-    # Mark Control Line Baseline
-    if len(res['c_base_x']) > 0:
-        c_val = res['c_base_y'][0]
-        ax.plot(res['c_base_x'], res['c_base_y'], 'r--', linewidth=2)
-        ax.fill_between(range(res['c_base_x'][0], res['c_base_x'][1]+1), 
-                         res['profile'][res['c_base_x'][0]:res['c_base_x'][1]+1], 
-                         c_val, alpha=0.3, color='orange')
-        ax.text(res['c_pos'], res['profile'][int(res['c_pos'])]+5, f"C:{res['c_area']:.1f}", color="red", ha='center')
+    if res['search_window']:
+        s, e = res['search_window']
+        ax.axvspan(s, e, color='gray', alpha=0.15, label='Search Zone')
 
-    # Remove the fixed gray span, since T-region is now dynamic
-    # ax.axvspan(...) 
-    
     ax.set_title(f"{title}\nR={res['ratio']:.4f}")
     plt.tight_layout()
     return fig
 
+# ... (The rest of detect_and_slice_strips and UI code remains exactly the same) ...
+# ... (Copy the detect_and_slice_strips, process_and_download, and UI handlers from the previous response) ...
 # ==========================================
-# NEW MODULE: AUTO-SEGMENTATION
+# (For completeness, simply pasting the previous UI Logic below will work perfectly with these new functions)
 # ==========================================
-def detect_and_slice_strips(full_img, top_crop, bottom_crop):
-    """
-    Takes the full image and the manual Y-coordinates.
-    detects white vertical strips and returns a list of cropped images.
-    """
-    # 1. Apply Manual Crop
-    roi = full_img[top_crop:bottom_crop, :]
-    
-    # 2. Convert to Grayscale & Threshold
+
+def detect_and_slice_strips(full_img, top, bottom):
+    roi = full_img[top:bottom, :]
     gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
-    
-    # Otsu's thresholding to find white parts
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    # 3. Vertical Projection (Sum pixels down columns)
-    # White strips will have HIGH sum, Black gaps will have LOW sum
-    vertical_sum = np.sum(thresh, axis=0)
+    v_sum = np.sum(thresh, axis=0)
+    v_sum = v_sum / np.max(v_sum)
     
-    # Normalize
-    vertical_sum = vertical_sum / np.max(vertical_sum)
-    
-    # 4. Find where the strips are (columns with signal > 0.5)
-    # We look for continuous regions of high intensity
-    strip_locs = []
+    locs = []
     in_strip = False
     start_x = 0
-    
-    # Threshold for "Is this a strip?"
-    col_threshold = 0.2 
-    
-    for x, val in enumerate(vertical_sum):
-        if val > col_threshold and not in_strip:
-            in_strip = True
-            start_x = x
-        elif val < col_threshold and in_strip:
+    for x, val in enumerate(v_sum):
+        if val > 0.2 and not in_strip:
+            in_strip, start_x = True, x
+        elif val < 0.2 and in_strip:
             in_strip = False
-            end_x = x
-            # Filter tiny noise (width must be > 10px)
-            if (end_x - start_x) > 20:
-                # Add margin to capture full width
-                margin = 5
-                s = max(0, start_x - margin)
-                e = min(roi.shape[1], end_x + margin)
-                strip_locs.append((s, e))
-                
-    # 5. Extract Images
-    strip_images = []
-    for (s, e) in strip_locs:
-        strip_img = roi[:, s:e]
-        strip_images.append(strip_img)
-        
-    return strip_images, strip_locs, roi
+            if (x - start_x) > 20:
+                locs.append((max(0, start_x-5), min(roi.shape[1], x+5)))
+    
+    return [roi[:, s:e] for s, e in locs], locs, roi
 
-# ==========================================
-# STREAMLIT UI
-# ==========================================
 st.set_page_config(page_title="LFA Auto-Analyzer", layout="wide")
 st.title("🧬 LFA Automatic Analyzer")
+mode = st.sidebar.radio("Input Mode", ["📂 Batch Upload", "✂️ Single Photo"])
 
-# Sidebar for Mode Selection
-analysis_mode = st.sidebar.radio("Select Input Mode", 
-    ["📂 Batch Upload (Already Cropped)", "✂️ Single Photo (Crop & Extract)"])
-
-if analysis_mode == "📂 Batch Upload (Already Cropped)":
-    st.info("Upload a folder of pre-cropped strip images (e.g. `00158_strip_1.jpg`).")
-    uploaded_files = st.file_uploader("Select Images", accept_multiple_files=True, type=['jpg', 'png', 'tif'])
+def process_and_download(image_list, filenames, video_ids, strip_ids):
+    zip_buf = io.BytesIO()
+    summary = []
+    prog = st.progress(0)
     
-    if uploaded_files and st.button("Start Batch Analysis"):
-        # ... (Same Batch Logic as before) ...
-        progress_bar = st.progress(0)
-        zip_buffer = io.BytesIO()
-        summary_rows = []
+    with zipfile.ZipFile(zip_buf, "w") as zf:
+        for i, (img, fname, vid, sid) in enumerate(zip(image_list, filenames, video_ids, strip_ids)):
+            prog.progress((i+1)/len(image_list))
+            
+            res_adj = analyze_single_strip(img, crop_margin=FIXED_CROP_MARGIN)
+            res_unadj = analyze_single_strip(img, crop_margin=0.0)
+            
+            if res_adj and res_unadj:
+                path = f"{vid}/strip_{sid}/"
+                for r, name, col in [(res_adj, 'adjusted', 'blue'), (res_unadj, 'unadjusted', 'gray')]:
+                    fig = create_plot(r, f"{name.title()}: {fname}", col)
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format='png')
+                    zf.writestr(f"{path}plot_{name}.png", buf.getvalue())
+                    plt.close(fig)
+
+                fig_c, ax = plt.subplots(figsize=(10,6))
+                ax.plot(res_unadj['profile'], 'gray', linestyle='--', alpha=0.6, label='Unadjusted')
+                ax.plot(res_adj['profile'], 'blue', linewidth=2, label='Adjusted')
+                if res_adj['search_window']:
+                    ax.axvspan(*res_adj['search_window'], color='gray', alpha=0.1)
+                ax.legend()
+                ax.set_title(f"Comparison: {fname}")
+                buf = io.BytesIO()
+                fig_c.savefig(buf, format='png')
+                zf.writestr(f"{path}plot_comparison.png", buf.getvalue())
+                plt.close(fig_c)
+
+                summary.append({"Video_ID": vid, "Strip_ID": sid, 
+                                "Adj_Ratio": res_adj['ratio'], "Unadj_Ratio": res_unadj['ratio']})
         
-        with zipfile.ZipFile(zip_buffer, "w") as zf:
-            for i, uploaded_file in enumerate(uploaded_files):
-                file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-                img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR) # Load as color for consistency
-                
-                filename = uploaded_file.name
-                progress_bar.progress((i + 1) / len(uploaded_files))
-                
-                # Logic to parse VideoID/StripID
-                video_id, strip_id = 0, i+1
-                match = re.match(r"(\d+)_strip_(\d+)", filename)
-                if match:
-                    video_id = int(match.group(1))
-                    strip_id = int(match.group(2))
-                
-                res_adj = analyze_single_strip(img, crop_margin=CROP_MARGIN)
-                res_unadj = analyze_single_strip(img, crop_margin=0.0)
-                
-                if res_adj and res_unadj:
-                    folder_path = f"{video_id}/strip_{strip_id}/"
-                    
-                    # Save Graphs
-                    fig_adj = create_plot(res_adj, f"Adjusted: {filename}")
-                    img_buf = io.BytesIO()
-                    fig_adj.savefig(img_buf, format='png')
-                    zf.writestr(f"{folder_path}plot_adjusted.png", img_buf.getvalue())
-                    plt.close(fig_adj)
-                    
-                    fig_unadj = create_plot(res_unadj, f"Unadjusted: {filename}", color='gray')
-                    img_buf = io.BytesIO()
-                    fig_unadj.savefig(img_buf, format='png')
-                    zf.writestr(f"{folder_path}plot_unadjusted.png", img_buf.getvalue())
-                    plt.close(fig_unadj)
-                    
-                    fig_comp, ax = plt.subplots(figsize=(10, 6))
-                    ax.plot(res_unadj['profile'], color='gray', linestyle='--', alpha=0.6, label='Unadjusted')
-                    ax.plot(res_adj['profile'], color='blue', linewidth=2, label='Adjusted')
-                    ax.set_title(f"Comparison: {filename}")
-                    img_buf = io.BytesIO()
-                    fig_comp.savefig(img_buf, format='png')
-                    zf.writestr(f"{folder_path}plot_comparison.png", img_buf.getvalue())
-                    plt.close(fig_comp)
-                    
-                    summary_rows.append({
-                        "Video_ID": video_id, "Strip_ID": strip_id,
-                        "Adj_Ratio": res_adj['ratio'], "Unadj_Ratio": res_unadj['ratio']
-                    })
+        if summary:
+            df = pd.DataFrame(summary)
+            excel_buf = io.BytesIO()
+            with pd.ExcelWriter(excel_buf, engine='xlsxwriter') as writer:
+                df.pivot_table(index="Video_ID", columns="Strip_ID", values="Adj_Ratio").to_excel(writer, sheet_name='Adjusted')
+                df.pivot_table(index="Video_ID", columns="Strip_ID", values="Unadj_Ratio").to_excel(writer, sheet_name='Unadjusted')
+            zf.writestr("Summary_Analysis.xlsx", excel_buf.getvalue())
 
-            if summary_rows:
-                df = pd.DataFrame(summary_rows)
-                # Pivot and Save Excel
-                pivot_adj = df.pivot_table(index="Video_ID", columns="Strip_ID", values="Adj_Ratio")
-                pivot_unadj = df.pivot_table(index="Video_ID", columns="Strip_ID", values="Unadj_Ratio")
-                
-                excel_buffer = io.BytesIO()
-                with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
-                    pivot_adj.to_excel(writer, sheet_name='Adjusted')
-                    pivot_unadj.to_excel(writer, sheet_name='Unadjusted')
-                zf.writestr("Summary_Analysis.xlsx", excel_buffer.getvalue())
+    st.success("Done!")
+    st.download_button("📥 Download ZIP", zip_buf.getvalue(), "LFA_Results.zip", "application/zip")
 
-        st.success("Processing Complete!")
-        st.download_button("📥 Download Results (ZIP)", data=zip_buffer.getvalue(), file_name="Batch_Results.zip", mime="application/zip")
+if mode == "📂 Batch Upload":
+    files = st.file_uploader("Upload Strips", accept_multiple_files=True, type=['jpg','png','tif'])
+    if files and st.button("Analyze Batch"):
+        imgs, names, vids, sids = [], [], [], []
+        for f in files:
+            imgs.append(cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_COLOR))
+            names.append(f.name)
+            m = re.match(r"(\d+)_strip_(\d+)", f.name)
+            vids.append(int(m.group(1)) if m else 0)
+            sids.append(int(m.group(2)) if m else 0)
+        process_and_download(imgs, names, vids, sids)
 
-
-elif analysis_mode == "✂️ Single Photo (Crop & Extract)":
-    st.info("Upload a photo containing multiple strips on a black board.")
-    uploaded_file = st.file_uploader("Upload Image", type=['jpg', 'png', 'jpeg'])
-
-    if uploaded_file:
-        # Load Image
-        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-        full_img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-        full_img = cv2.cvtColor(full_img, cv2.COLOR_BGR2RGB) # Fix colors for display
-        
-        height, width, _ = full_img.shape
-        
-        st.write("### Step 1: Adjust Crop Region")
-        st.markdown("Use the sliders to define the **Top** and **Bottom** boundaries of the white windows.")
-        
-        col1, col2 = st.columns([1, 3])
-        with col1:
-            top_crop = st.slider("Top Cut", 0, height, int(height*0.3))
-            bottom_crop = st.slider("Bottom Cut", 0, height, int(height*0.7))
-        
-        with col2:
-            # Visualize the crop lines
-            display_img = full_img.copy()
-            cv2.line(display_img, (0, top_crop), (width, top_crop), (255, 0, 0), 5) # Red Line Top
-            cv2.line(display_img, (0, bottom_crop), (width, bottom_crop), (255, 0, 0), 5) # Red Line Bottom
-            st.image(display_img, use_container_width=True)
-
-        if bottom_crop > top_crop:
-            if st.button("Detect & Analyze Strips"):
-                
-                # Perform Auto-Segmentation
-                strips, locs, roi_img = detect_and_slice_strips(full_img, top_crop, bottom_crop)
-                
-                st.write(f"### Step 2: Found {len(strips)} Strips")
-                
-                # Visualize detection
-                for (s, e) in locs:
-                    cv2.rectangle(roi_img, (s, 0), (e, roi_img.shape[0]), (0, 255, 0), 2)
-                st.image(roi_img, caption="Detected Boundaries (Green)", use_container_width=True)
-                
-                # Process extracted strips
-                zip_buffer = io.BytesIO()
-                summary_rows = []
-                
-                with zipfile.ZipFile(zip_buffer, "w") as zf:
-                    # Save the "Master Crop" image for reference
-                    img_buf = io.BytesIO()
-                    plt.imsave(img_buf, roi_img, format='png')
-                    zf.writestr("Detection_Reference.png", img_buf.getvalue())
-                    
-                    cols = st.columns(min(len(strips), 5)) # Display preview of first 5
-                    
-                    for i, strip_img in enumerate(strips):
-                        strip_id = i + 1
-                        
-                        # Analyze
-                        res_adj = analyze_single_strip(strip_img, crop_margin=CROP_MARGIN)
-                        res_unadj = analyze_single_strip(strip_img, crop_margin=0.0)
-                        
-                        if res_adj and res_unadj:
-                            # Display mini preview
-                            if i < 5:
-                                cols[i].image(strip_img, caption=f"Strip {strip_id}")
-                            
-                            folder_path = f"Extracted_Strips/strip_{strip_id}/"
-                            
-                            # Save Graphs
-                            fig_adj = create_plot(res_adj, f"Strip {strip_id} (Adj)")
-                            img_buf = io.BytesIO()
-                            fig_adj.savefig(img_buf, format='png')
-                            zf.writestr(f"{folder_path}plot_adjusted.png", img_buf.getvalue())
-                            plt.close(fig_adj)
-                            
-                            fig_unadj = create_plot(res_unadj, f"Strip {strip_id} (Unadj)", color='gray')
-                            img_buf = io.BytesIO()
-                            fig_unadj.savefig(img_buf, format='png')
-                            zf.writestr(f"{folder_path}plot_unadjusted.png", img_buf.getvalue())
-                            plt.close(fig_unadj)
-                            
-                            fig_comp, ax = plt.subplots(figsize=(10, 6))
-                            ax.plot(res_unadj['profile'], color='gray', linestyle='--', alpha=0.6)
-                            ax.plot(res_adj['profile'], color='blue', linewidth=2)
-                            ax.set_title(f"Comparison Strip {strip_id}")
-                            img_buf = io.BytesIO()
-                            fig_comp.savefig(img_buf, format='png')
-                            zf.writestr(f"{folder_path}plot_comparison.png", img_buf.getvalue())
-                            plt.close(fig_comp)
-                            
-                            summary_rows.append({
-                                "Video_ID": 1, "Strip_ID": strip_id, # Default Video ID 1 for single photo
-                                "Adj_Ratio": res_adj['ratio'], "Unadj_Ratio": res_unadj['ratio']
-                            })
-
-                    # Excel Summary
-                    if summary_rows:
-                        df = pd.DataFrame(summary_rows)
-                        excel_buffer = io.BytesIO()
-                        with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
-                            df.to_excel(writer, sheet_name='Summary', index=False)
-                        zf.writestr("Summary_Analysis.xlsx", excel_buffer.getvalue())
-                
-                st.success("Analysis Complete!")
-                st.download_button("📥 Download Extracted Results", data=zip_buffer.getvalue(), file_name="Extracted_Analysis.zip", mime="application/zip")
+elif mode == "✂️ Single Photo":
+    f = st.file_uploader("Upload Board Photo", type=['jpg','png'])
+    if f:
+        full_img = cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_COLOR)
+        full_img = cv2.cvtColor(full_img, cv2.COLOR_BGR2RGB)
+        h, w, _ = full_img.shape
+        c1, c2 = st.columns([1, 3])
+        top = c1.slider("Top Crop", 0, h, int(h*0.3))
+        bot = c1.slider("Bottom Crop", 0, h, int(h*0.7))
+        prev = full_img.copy()
+        cv2.line(prev, (0, top), (w, top), (255,0,0), 5)
+        cv2.line(prev, (0, bot), (w, bot), (255,0,0), 5)
+        c2.image(prev, use_container_width=True)
+        if bot > top and st.button("Extract & Analyze"):
+            strips, locs, _ = detect_and_slice_strips(full_img, top, bot)
+            st.write(f"Found {len(strips)} strips")
+            process_and_download(strips, [f"Strip_{i+1}" for i in range(len(strips))], 
+                                 [1]*len(strips), list(range(1, len(strips)+1)))
