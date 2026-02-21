@@ -1,6 +1,4 @@
-=========================================================
 LFA Automatic Analyzer - Streamlit Web App
-=========================================================
 
 DESCRIPTION
 This is a Python-based web application built with Streamlit to automatically process, analyze, and quantify Lateral Flow Assay (LFA) strips. It extracts the Test (T) and Control (C) line intensities, applies baseline corrections, calculates the T/C area ratios, and generates visual plots and a summary Excel report.
