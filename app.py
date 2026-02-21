@@ -9,19 +9,15 @@ import zipfile
 import re
 
 # ==========================================
-# ⚙️ HARDCODED KNOBS
-# ==========================================
 FIXED_CROP_MARGIN = 0.1
 SMOOTH_WINDOW = 15
 MAX_PEAK_WIDTH = 30 # Upper limit: If a peak is wider than this, we clip it.
 
 # --- Search Parameters ---
-T_DIST_NEAR = 20
-T_DIST_FAR = 120
+T_DIST_NEAR = 30
+T_DIST_FAR = 100
 BASELINE_METHOD = 'lower'
 
-# ==========================================
-# CORE ALGORITHMS
 # ==========================================
 def flatten_profile(profile):
     x = np.arange(len(profile))
@@ -166,12 +162,6 @@ def create_plot(res, title, color='blue'):
     plt.tight_layout()
     return fig
 
-# ... (The rest of detect_and_slice_strips and UI code remains exactly the same) ...
-# ... (Copy the detect_and_slice_strips, process_and_download, and UI handlers from the previous response) ...
-# ==========================================
-# (For completeness, simply pasting the previous UI Logic below will work perfectly with these new functions)
-# ==========================================
-
 def detect_and_slice_strips(full_img, top, bottom):
     roi = full_img[top:bottom, :]
     gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY)
@@ -275,3 +265,4 @@ elif mode == "✂️ Single Photo":
             st.write(f"Found {len(strips)} strips")
             process_and_download(strips, [f"Strip_{i+1}" for i in range(len(strips))], 
                                  [1]*len(strips), list(range(1, len(strips)+1)))
+
