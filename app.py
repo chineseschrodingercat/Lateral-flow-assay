@@ -8,17 +8,16 @@ import io
 import zipfile
 import re
 
-# ==========================================
+
 FIXED_CROP_MARGIN = 0.1
 SMOOTH_WINDOW = 15
-MAX_PEAK_WIDTH = 30 # Upper limit: If a peak is wider than this, we clip it.
+MAX_PEAK_WIDTH = 30
 
 # --- Search Parameters ---
 T_DIST_NEAR = 30
 T_DIST_FAR = 100
 BASELINE_METHOD = 'lower'
 
-# ==========================================
 def flatten_profile(profile):
     x = np.arange(len(profile))
     margin = int(len(profile) * 0.10)
@@ -30,7 +29,56 @@ def flatten_profile(profile):
         return flattened - np.min(flattened)
     return profile
 
-def analyze_single_strip(img_array, crop_margin=FIXED_CROP_MARGIN):
+def create_plot(res, title, color='blue'):
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(res['profile'], color=color, linewidth=2)
+    
+    global_base = None
+    if len(res['c_base_y']) > 0:
+        global_base = res['c_base_y'][0]
+    elif len(res['t_base_y']) > 0:
+        global_base = res['t_base_y'][0]
+        
+    if global_base is not None:
+        ax.axhline(y=global_base, color='r', linestyle='--', linewidth=2, label='Global Baseline')
+
+    for p_type, col in [('t', 'green'), ('c', 'orange')]:
+        if len(res[f'{p_type}_base_x']) > 0:
+            bx = res[f'{p_type}_base_x']
+            ax.fill_between(range(bx[0], bx[1]+1), 
+                            res['profile'][bx[0]:bx[1]+1], 
+                            global_base, 
+                            alpha=0.3, color=col)
+            if not np.isnan(res[f'{p_type}_pos']):
+                ax.text(res[f'{p_type}_pos'], res['profile'][int(res[f'{p_type}_pos'])]+5, 
+                        f"{p_type.upper()}:{res[f'{p_type}_area']:.1f}", color='red', ha='center')
+
+    if res['search_window']:
+        s, e = res['search_window']
+        ax.axvspan(s, e, color='gray', alpha=0.15, label='Search Zone')
+
+    ax.set_title(f"{title}\nR={res['ratio']:.4f}")
+    plt.tight_layout()
+    return fig
+
+def get_peak_bounds(peak_pos, left_idx, right_idx, height):
+    x_s = int(left_idx)
+    x_e = int(right_idx)
+    
+    current_width = x_e - x_s
+    
+    if current_width > MAX_PEAK_WIDTH:
+        half_max = MAX_PEAK_WIDTH // 2
+        x_s = max(0, int(peak_pos - half_max))
+        x_e = min(height - 1, int(peak_pos + half_max))
+    else:
+        x_s = max(0, x_s)
+        x_e = min(height - 1, x_e)
+        
+    return x_s, x_e
+
+# --- UPDATE: pass dynamic_prominence as an argument ---
+def analyze_single_strip(img_array, t_dist_near, t_dist_far, dynamic_prominence, crop_margin=FIXED_CROP_MARGIN):
     if len(img_array.shape) == 3: img = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
     else: img = img_array
 
@@ -49,7 +97,9 @@ def analyze_single_strip(img_array, crop_margin=FIXED_CROP_MARGIN):
         smooth_profile = raw_profile
     
     smooth_profile = flatten_profile(smooth_profile)
-    peaks, properties = find_peaks(smooth_profile, prominence=0.5, distance=10, width=2)
+    
+    # --- Use the dynamic prominence value based on UI selection ---
+    peaks, properties = find_peaks(smooth_profile, prominence=dynamic_prominence, distance=10, width=2)
     
     res = {
         "profile": smooth_profile, "ratio": 0.0,
@@ -59,108 +109,70 @@ def analyze_single_strip(img_array, crop_margin=FIXED_CROP_MARGIN):
         "search_window": []
     }
     
-    # Calculate widths for ALL peaks found
-    # rel_height=0.95 measures width near the base of the peak
     widths_results = peak_widths(smooth_profile, peaks, rel_height=0.95)
-    
-    # 3. Find CONTROL Line
     height = len(smooth_profile)
     split_point = int(height * 0.5)
-    c_candidates = [p for p in peaks if p > split_point]
     
+    c_bounds = None
+    t_bounds = None
+    
+    c_candidates = [p for p in peaks if p > split_point]
     if c_candidates:
         c_indices = [np.where(peaks == p)[0][0] for p in c_candidates]
         best_c_idx = c_indices[np.argmax(properties['prominences'][c_indices])]
-        best_c = peaks[best_c_idx]
-        res['c_pos'] = best_c
+        res['c_pos'] = peaks[best_c_idx]
         
-        # Get the detected width for this specific peak
-        # widths_results[2] is Left Intersection, widths_results[3] is Right Intersection
         c_left = widths_results[2][best_c_idx]
         c_right = widths_results[3][best_c_idx]
-        
-        integrate_peak_smart(res, best_c, c_left, c_right, height, 'c')
+        c_bounds = get_peak_bounds(res['c_pos'], c_left, c_right, height)
 
-        # 4. Find TEST Line
-        search_end = int(best_c - T_DIST_NEAR)
-        search_start = max(0, int(best_c - T_DIST_FAR))
+    if not np.isnan(res['c_pos']):
+        search_end = int(res['c_pos'] - t_dist_near)
+        search_start = max(0, int(res['c_pos'] - t_dist_far))
         res['search_window'] = [search_start, search_end]
         
         t_candidates = [p for p in peaks if search_start <= p < search_end]
-        
         if t_candidates:
             t_indices = [np.where(peaks == p)[0][0] for p in t_candidates]
             best_t_idx = t_indices[np.argmax(properties['prominences'][t_indices])]
-            best_t = peaks[best_t_idx]
-            res['t_pos'] = best_t
+            res['t_pos'] = peaks[best_t_idx]
             
             t_left = widths_results[2][best_t_idx]
             t_right = widths_results[3][best_t_idx]
-            
-            integrate_peak_smart(res, best_t, t_left, t_right, height, 't')
+            t_bounds = get_peak_bounds(res['t_pos'], t_left, t_right, height)
+
+    y_vals_for_baseline = []
+    if c_bounds and c_bounds[1] > c_bounds[0]:
+        y_vals_for_baseline.extend([smooth_profile[c_bounds[0]], smooth_profile[c_bounds[1]]])
+    if t_bounds and t_bounds[1] > t_bounds[0]:
+        y_vals_for_baseline.extend([smooth_profile[t_bounds[0]], smooth_profile[t_bounds[1]]])
+
+    if y_vals_for_baseline:
+        if BASELINE_METHOD == 'lower':
+            global_base_val = min(y_vals_for_baseline)
+        elif BASELINE_METHOD == 'higher':
+            global_base_val = max(y_vals_for_baseline)
+        else:
+            global_base_val = sum(y_vals_for_baseline) / len(y_vals_for_baseline)
+    else:
+        global_base_val = 0
+
+    if c_bounds and c_bounds[1] > c_bounds[0]:
+        x_s, x_e = c_bounds
+        curve_segment = np.maximum(smooth_profile[x_s:x_e+1] - global_base_val, 0)
+        res['c_area'] = np.sum(curve_segment)
+        res['c_base_x'] = [x_s, x_e]
+        res['c_base_y'] = [global_base_val, global_base_val]
+
+    if t_bounds and t_bounds[1] > t_bounds[0]:
+        x_s, x_e = t_bounds
+        curve_segment = np.maximum(smooth_profile[x_s:x_e+1] - global_base_val, 0)
+        res['t_area'] = np.sum(curve_segment)
+        res['t_base_x'] = [x_s, x_e]
+        res['t_base_y'] = [global_base_val, global_base_val]
 
     res['ratio'] = res['t_area'] / res['c_area'] if res['c_area'] > 0 else 0
     return res
-
-def integrate_peak_smart(res, peak_pos, left_idx, right_idx, height, prefix):
-    """
-    Uses detected peak width BUT clamps it if it exceeds MAX_PEAK_WIDTH.
-    """
-    # 1. Get detected start/end
-    x_s = int(left_idx)
-    x_e = int(right_idx)
-    
-    # 2. Check width
-    current_width = x_e - x_s
-    
-    # 3. Clamp if too wide (Center +/- Max/2)
-    if current_width > MAX_PEAK_WIDTH:
-        half_max = MAX_PEAK_WIDTH // 2
-        x_s = max(0, int(peak_pos - half_max))
-        x_e = min(height - 1, int(peak_pos + half_max))
-    else:
-        # Safety bounds
-        x_s = max(0, x_s)
-        x_e = min(height - 1, x_e)
-
-    if x_e > x_s:
-        curve = res['profile']
-        y_s = curve[x_s]
-        y_e = curve[x_e]
-        
-        if BASELINE_METHOD == 'lower':
-            base_val = min(y_s, y_e)
-        elif BASELINE_METHOD == 'higher':
-            base_val = max(y_s, y_e)
-        else: # average
-            base_val = (y_s + y_e) / 2
-            
-        area = np.sum(curve[x_s:x_e+1] - base_val)
-        
-        res[f'{prefix}_area'] = area
-        res[f'{prefix}_base_x'] = [x_s, x_e]
-        res[f'{prefix}_base_y'] = [base_val, base_val]
-
-def create_plot(res, title, color='blue'):
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(res['profile'], color=color, linewidth=2)
-    
-    for p_type, col in [('t', 'green'), ('c', 'orange')]:
-        if len(res[f'{p_type}_base_x']) > 0:
-            bx, by = res[f'{p_type}_base_x'], res[f'{p_type}_base_y']
-            ax.plot(bx, by, 'r--', linewidth=2)
-            ax.fill_between(range(bx[0], bx[1]+1), res['profile'][bx[0]:bx[1]+1], by[0], alpha=0.3, color=col)
-            if not np.isnan(res[f'{p_type}_pos']):
-                ax.text(res[f'{p_type}_pos'], res['profile'][int(res[f'{p_type}_pos'])]+5, 
-                        f"{p_type.upper()}:{res[f'{p_type}_area']:.1f}", color='red', ha='center')
-
-    if res['search_window']:
-        s, e = res['search_window']
-        ax.axvspan(s, e, color='gray', alpha=0.15, label='Search Zone')
-
-    ax.set_title(f"{title}\nR={res['ratio']:.4f}")
-    plt.tight_layout()
-    return fig
 
 def detect_and_slice_strips(full_img, top, bottom):
     roi = full_img[top:bottom, :]
@@ -186,9 +198,23 @@ def detect_and_slice_strips(full_img, top, bottom):
 
 st.set_page_config(page_title="LFA Auto-Analyzer", layout="wide")
 st.title("🧬 LFA Automatic Analyzer")
+
+# --- UI FOR STRIP TYPE SELECTION ---
+strip_type = st.sidebar.radio(
+    "Select Strip Type",
+    ("Traditional (e.g., hCG)", "Competitive (e.g., Xylazine)"),
+    help="Traditional uses higher sensitivity to find faint lines. Competitive uses lower sensitivity to ignore noise."
+)
+
+# Set the prominence based on the selection
+if strip_type == "Traditional (e.g., hCG)":
+    current_prominence = 0.5
+else:
+    current_prominence = 1.8
+
 mode = st.sidebar.radio("Input Mode", ["📂 Batch Upload", "✂️ Single Photo"])
 
-def process_and_download(image_list, filenames, video_ids, strip_ids):
+def process_and_download(image_list, filenames, video_ids, strip_ids, active_prominence):
     zip_buf = io.BytesIO()
     summary = []
     prog = st.progress(0)
@@ -197,8 +223,9 @@ def process_and_download(image_list, filenames, video_ids, strip_ids):
         for i, (img, fname, vid, sid) in enumerate(zip(image_list, filenames, video_ids, strip_ids)):
             prog.progress((i+1)/len(image_list))
             
-            res_adj = analyze_single_strip(img, crop_margin=FIXED_CROP_MARGIN)
-            res_unadj = analyze_single_strip(img, crop_margin=0.0)
+            # --- Pass the active_prominence down ---
+            res_adj = analyze_single_strip(img, T_DIST_NEAR, T_DIST_FAR, active_prominence, crop_margin=FIXED_CROP_MARGIN)
+            res_unadj = analyze_single_strip(img, T_DIST_NEAR, T_DIST_FAR, active_prominence, crop_margin=0.0)
             
             if res_adj and res_unadj:
                 path = f"{vid}/strip_{sid}/"
@@ -245,7 +272,8 @@ if mode == "📂 Batch Upload":
             m = re.match(r"(\d+)_strip_(\d+)", f.name)
             vids.append(int(m.group(1)) if m else 0)
             sids.append(int(m.group(2)) if m else 0)
-        process_and_download(imgs, names, vids, sids)
+        # Pass current_prominence to processor
+        process_and_download(imgs, names, vids, sids, current_prominence)
 
 elif mode == "✂️ Single Photo":
     f = st.file_uploader("Upload Board Photo", type=['jpg','png'])
@@ -263,6 +291,6 @@ elif mode == "✂️ Single Photo":
         if bot > top and st.button("Extract & Analyze"):
             strips, locs, _ = detect_and_slice_strips(full_img, top, bot)
             st.write(f"Found {len(strips)} strips")
+            # Pass current_prominence to processor
             process_and_download(strips, [f"Strip_{i+1}" for i in range(len(strips))], 
-                                 [1]*len(strips), list(range(1, len(strips)+1)))
-
+                                 [1]*len(strips), list(range(1, len(strips)+1)), current_prominence)
